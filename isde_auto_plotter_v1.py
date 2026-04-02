@@ -57,16 +57,27 @@ def prompt_int_list(prompt_text):
             print("Please enter comma-separated integers like 5,10,12")
 
 
+def prompt_sheet_choice(sheet_names):
+    print("\nAvailable sheets:")
+    for i, name in enumerate(sheet_names):
+        print(f"{i}: {name}")
+
+    while True:
+        raw = input("Choose sheet number: ").strip()
+        try:
+            idx = int(raw)
+            if 0 <= idx < len(sheet_names):
+                return sheet_names[idx]
+            print("Invalid sheet number.")
+        except ValueError:
+            print("Please enter a valid integer.")
+
+
 def row_is_blank(values):
     return all(v is None or str(v).strip() == "" for v in values)
 
 
 def find_tables_in_sheet(ws):
-    """
-    Scan entire sheet for any row that contains the required headers,
-    even if the table starts somewhere in the middle of the sheet.
-    Returns a list of DataFrames found in the sheet.
-    """
     tables = []
     max_row = ws.max_row
     max_col = ws.max_column
@@ -93,16 +104,15 @@ def find_tables_in_sheet(ws):
 
         scanned_header_rows.add(r)
 
-        min_col = min(header_positions.values())
-        max_header_col = max(header_positions.values())
-
         data_rows = []
         blank_streak = 0
 
         for rr in range(r + 1, max_row + 1):
-            vals = [ws.cell(rr, c).value for c in range(min_col, max_header_col + 1)]
+            row_dict = {}
+            for col_name, col_idx in header_positions.items():
+                row_dict[col_name] = ws.cell(rr, col_idx).value
 
-            if row_is_blank(vals):
+            if row_is_blank(list(row_dict.values())):
                 blank_streak += 1
                 if blank_streak >= 2:
                     break
@@ -110,13 +120,7 @@ def find_tables_in_sheet(ws):
             else:
                 blank_streak = 0
 
-            row_dict = {}
-            for col_name, col_idx in header_positions.items():
-                row_dict[col_name] = ws.cell(rr, col_idx).value
-
-            # keep only rows that are not completely empty across required cols
-            if not all(v is None or str(v).strip() == "" for v in row_dict.values()):
-                data_rows.append(row_dict)
+            data_rows.append(row_dict)
 
         if data_rows:
             df = pd.DataFrame(data_rows)
@@ -127,25 +131,10 @@ def find_tables_in_sheet(ws):
     return tables
 
 
-def extract_all_candidate_tables(file_path):
-    wb = load_workbook(file_path, data_only=True)
-    all_tables = []
-
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        tables = find_tables_in_sheet(ws)
-        all_tables.extend(tables)
-
-    return all_tables
-
-
 def clean_table(df):
     df = df.copy()
-
-    # normalize column names
     df.columns = [str(c).strip() for c in df.columns]
 
-    # force expected names
     rename_map = {}
     for c in df.columns:
         lc = c.strip().lower()
@@ -153,11 +142,9 @@ def clean_table(df):
             rename_map[c] = lc
     df = df.rename(columns=rename_map)
 
-    # input as string
     if "input" in df.columns:
         df["input"] = df["input"].astype(str).str.strip()
 
-    # numeric conversions
     for col in ["vdd", "freq", "actual_freq", "sr_num", "cs", "upper", "lower"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -193,7 +180,16 @@ def main():
 
     file_path = input("Excel file path: ").strip()
 
-    print("\nEnter all plot settings first.\n")
+    try:
+        wb = load_workbook(file_path, data_only=True)
+    except Exception as e:
+        print(f"Could not open workbook: {e}")
+        return
+
+    selected_sheet_name = prompt_sheet_choice(wb.sheetnames)
+    ws = wb[selected_sheet_name]
+
+    print("\nEnter all plot settings.\n")
 
     x_axis = prompt_choice("Choose x-axis (vdd, let, frq): ", ["vdd", "let", "frq"])
     input_val = input("Input value: ").strip()
@@ -213,12 +209,12 @@ def main():
     if x_axis != "frq":
         freq_val = prompt_float("Specify freq: ")
 
-    print("\nScanning all sheets for matching embedded tables...")
+    print(f"\nScanning sheet '{selected_sheet_name}' for matching embedded tables...")
 
-    all_tables = extract_all_candidate_tables(file_path)
+    all_tables = find_tables_in_sheet(ws)
 
     if not all_tables:
-        print("No tables with the required columns were found anywhere in the workbook.")
+        print("No tables with the required columns were found in that sheet.")
         return
 
     matched_frames = []
@@ -227,7 +223,11 @@ def main():
         try:
             df = clean_table(raw_df)
 
-            needed = {"vdd", "input", "ion", "freq", "actual_freq", "sr_num", "cs", "upper", "lower", "source_sheet", "header_row", "LET"}
+            needed = {
+                "vdd", "input", "ion", "freq", "actual_freq",
+                "sr_num", "cs", "upper", "lower",
+                "source_sheet", "header_row", "LET"
+            }
             if not needed.issubset(set(df.columns)):
                 continue
 
@@ -248,7 +248,7 @@ def main():
             continue
 
     if not matched_frames:
-        print("No matching data found across any embedded tables in the workbook.")
+        print("No matching data found in the selected sheet.")
         return
 
     combined = pd.concat(matched_frames, ignore_index=True)
@@ -264,7 +264,6 @@ def main():
         xlabel = "Frequency"
 
     combined["y"] = combined["cs"]
-
     combined = combined.dropna(subset=["x", "y", "lower", "upper", "sr_num"])
 
     if combined.empty:
