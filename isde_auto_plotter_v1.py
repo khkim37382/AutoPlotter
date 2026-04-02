@@ -1,13 +1,18 @@
 import pandas as pd
 import matplotlib.pyplot as plt
+from openpyxl import load_workbook
 
 
-REQUIRED_COLUMNS = {"vdd", "input", "ion", "freq", "actual_freq", "sr_num", "cs", "upper", "lower"}
+REQUIRED_COLUMNS = {
+    "vdd", "input", "ion", "freq", "actual_freq",
+    "sr_num", "cs", "upper", "lower"
+}
 
 
-def normalize_columns(df):
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+def norm(value):
+    if value is None:
+        return ""
+    return str(value).strip().lower()
 
 
 def extract_let_from_ion(ion_value):
@@ -20,6 +25,15 @@ def extract_let_from_ion(ion_value):
         return float(ion_str.split("-")[-1])
     except ValueError:
         return None
+
+
+def prompt_choice(prompt_text, valid_choices):
+    valid = [v.lower() for v in valid_choices]
+    while True:
+        value = input(prompt_text).strip().lower()
+        if value in valid:
+            return value
+        print(f"Please enter one of: {', '.join(valid_choices)}")
 
 
 def prompt_float(prompt_text):
@@ -35,93 +49,151 @@ def prompt_int_list(prompt_text):
     while True:
         raw = input(prompt_text).strip()
         try:
-            return [int(x.strip()) for x in raw.split(",") if x.strip()]
+            values = [int(x.strip()) for x in raw.split(",") if x.strip()]
+            if values:
+                return values
+            print("Please enter at least one SR number.")
         except ValueError:
             print("Please enter comma-separated integers like 5,10,12")
 
 
-def prompt_choice(prompt_text, valid_choices):
-    valid_choices = [x.lower() for x in valid_choices]
-    while True:
-        value = input(prompt_text).strip().lower()
-        if value in valid_choices:
-            return value
-        print(f"Please enter one of: {', '.join(valid_choices)}")
+def row_is_blank(values):
+    return all(v is None or str(v).strip() == "" for v in values)
 
 
-def sheet_has_required_columns(file_path, sheet_name, header_row):
-    try:
-        df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row, nrows=5)
-        df = normalize_columns(df)
-        cols_lower = {str(c).strip().lower() for c in df.columns}
-        return REQUIRED_COLUMNS.issubset(cols_lower)
-    except Exception:
-        return False
+def find_tables_in_sheet(ws):
+    """
+    Scan entire sheet for any row that contains the required headers,
+    even if the table starts somewhere in the middle of the sheet.
+    Returns a list of DataFrames found in the sheet.
+    """
+    tables = []
+    max_row = ws.max_row
+    max_col = ws.max_column
+    scanned_header_rows = set()
+
+    for r in range(1, max_row + 1):
+        row_vals = [ws.cell(r, c).value for c in range(1, max_col + 1)]
+        normalized = [norm(v) for v in row_vals]
+
+        present = set(v for v in normalized if v)
+        if not REQUIRED_COLUMNS.issubset(present):
+            continue
+
+        if r in scanned_header_rows:
+            continue
+
+        header_positions = {}
+        for c_idx, cell_val in enumerate(normalized, start=1):
+            if cell_val in REQUIRED_COLUMNS and cell_val not in header_positions:
+                header_positions[cell_val] = c_idx
+
+        if not REQUIRED_COLUMNS.issubset(set(header_positions.keys())):
+            continue
+
+        scanned_header_rows.add(r)
+
+        min_col = min(header_positions.values())
+        max_header_col = max(header_positions.values())
+
+        data_rows = []
+        blank_streak = 0
+
+        for rr in range(r + 1, max_row + 1):
+            vals = [ws.cell(rr, c).value for c in range(min_col, max_header_col + 1)]
+
+            if row_is_blank(vals):
+                blank_streak += 1
+                if blank_streak >= 2:
+                    break
+                continue
+            else:
+                blank_streak = 0
+
+            row_dict = {}
+            for col_name, col_idx in header_positions.items():
+                row_dict[col_name] = ws.cell(rr, col_idx).value
+
+            # keep only rows that are not completely empty across required cols
+            if not all(v is None or str(v).strip() == "" for v in row_dict.values()):
+                data_rows.append(row_dict)
+
+        if data_rows:
+            df = pd.DataFrame(data_rows)
+            df["source_sheet"] = ws.title
+            df["header_row"] = r
+            tables.append(df)
+
+    return tables
 
 
-def find_candidate_sheets(file_path):
-    xls = pd.ExcelFile(file_path)
-    candidates = []
+def extract_all_candidate_tables(file_path):
+    wb = load_workbook(file_path, data_only=True)
+    all_tables = []
 
-    for sheet in xls.sheet_names:
-        for header_row in range(0, 20):
-            if sheet_has_required_columns(file_path, sheet, header_row):
-                candidates.append((sheet, header_row))
-                break
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        tables = find_tables_in_sheet(ws)
+        all_tables.extend(tables)
 
-    return candidates
+    return all_tables
 
 
-def load_and_filter_sheet(file_path, sheet_name, header_row, x_axis, input_val, sr_nums,
-                          vdd_val=None, let_val=None, freq_val=None):
-    try:
-        df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row)
-    except Exception:
-        return pd.DataFrame()
+def clean_table(df):
+    df = df.copy()
 
-    df = normalize_columns(df)
-    colmap = {c.lower(): c for c in df.columns}
+    # normalize column names
+    df.columns = [str(c).strip() for c in df.columns]
 
-    df = df.rename(columns={
-        colmap["vdd"]: "vdd",
-        colmap["input"]: "input",
-        colmap["ion"]: "ion",
-        colmap["freq"]: "freq",
-        colmap["actual_freq"]: "actual_freq",
-        colmap["sr_num"]: "SR_NUM",
-        colmap["cs"]: "cs",
-        colmap["upper"]: "upper",
-        colmap["lower"]: "lower",
-    })
+    # force expected names
+    rename_map = {}
+    for c in df.columns:
+        lc = c.strip().lower()
+        if lc in REQUIRED_COLUMNS:
+            rename_map[c] = lc
+    df = df.rename(columns=rename_map)
 
-    df["LET"] = df["ion"].apply(extract_let_from_ion)
-    df["input"] = df["input"].astype(str).str.strip()
+    # input as string
+    if "input" in df.columns:
+        df["input"] = df["input"].astype(str).str.strip()
 
+    # numeric conversions
+    for col in ["vdd", "freq", "actual_freq", "sr_num", "cs", "upper", "lower"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "ion" in df.columns:
+        df["LET"] = df["ion"].apply(extract_let_from_ion)
+    else:
+        df["LET"] = None
+
+    return df
+
+
+def filter_table(df, x_axis, input_val, sr_nums, vdd_val=None, let_val=None, freq_val=None):
     filtered = df.copy()
+
     filtered = filtered[filtered["input"] == input_val]
-    filtered = filtered[filtered["SR_NUM"].isin(sr_nums)]
+    filtered = filtered[filtered["sr_num"].isin(sr_nums)]
 
-    if x_axis != "vdd" and vdd_val is not None:
-        filtered = filtered[pd.to_numeric(filtered["vdd"], errors="coerce") == vdd_val]
+    if x_axis != "vdd":
+        filtered = filtered[filtered["vdd"] == vdd_val]
 
-    if x_axis != "let" and let_val is not None:
-        filtered = filtered[pd.to_numeric(filtered["LET"], errors="coerce") == let_val]
+    if x_axis != "let":
+        filtered = filtered[filtered["LET"] == let_val]
 
-    if x_axis != "frq" and freq_val is not None:
-        filtered = filtered[pd.to_numeric(filtered["freq"], errors="coerce") == freq_val]
+    if x_axis != "frq":
+        filtered = filtered[filtered["freq"] == freq_val]
 
-    if filtered.empty:
-        return pd.DataFrame()
-
-    filtered["source_sheet"] = sheet_name
     return filtered
 
 
 def main():
     print("=== ISDE Automatic Plotter ===")
+
     file_path = input("Excel file path: ").strip()
 
-    print("\nEnter plot settings first.\n")
+    print("\nEnter all plot settings first.\n")
 
     x_axis = prompt_choice("Choose x-axis (vdd, let, frq): ", ["vdd", "let", "frq"])
     input_val = input("Input value: ").strip()
@@ -141,61 +213,67 @@ def main():
     if x_axis != "frq":
         freq_val = prompt_float("Specify freq: ")
 
-    print("\nSearching across all sheets...")
+    print("\nScanning all sheets for matching embedded tables...")
 
-    candidates = find_candidate_sheets(file_path)
+    all_tables = extract_all_candidate_tables(file_path)
 
-    if not candidates:
-        print("No sheets with the required columns were found.")
+    if not all_tables:
+        print("No tables with the required columns were found anywhere in the workbook.")
         return
 
-    all_matches = []
+    matched_frames = []
 
-    for sheet_name, header_row in candidates:
-        filtered = load_and_filter_sheet(
-            file_path=file_path,
-            sheet_name=sheet_name,
-            header_row=header_row,
-            x_axis=x_axis,
-            input_val=input_val,
-            sr_nums=sr_nums,
-            vdd_val=vdd_val,
-            let_val=let_val,
-            freq_val=freq_val,
-        )
-        if not filtered.empty:
-            all_matches.append(filtered)
+    for raw_df in all_tables:
+        try:
+            df = clean_table(raw_df)
 
-    if not all_matches:
-        print("No matching data found across any sheets.")
+            needed = {"vdd", "input", "ion", "freq", "actual_freq", "sr_num", "cs", "upper", "lower", "source_sheet", "header_row", "LET"}
+            if not needed.issubset(set(df.columns)):
+                continue
+
+            filtered = filter_table(
+                df,
+                x_axis=x_axis,
+                input_val=input_val,
+                sr_nums=sr_nums,
+                vdd_val=vdd_val,
+                let_val=let_val,
+                freq_val=freq_val
+            )
+
+            if not filtered.empty:
+                matched_frames.append(filtered)
+
+        except Exception:
+            continue
+
+    if not matched_frames:
+        print("No matching data found across any embedded tables in the workbook.")
         return
 
-    combined = pd.concat(all_matches, ignore_index=True)
+    combined = pd.concat(matched_frames, ignore_index=True)
 
     if x_axis == "vdd":
-        combined["x"] = pd.to_numeric(combined["vdd"], errors="coerce")
+        combined["x"] = combined["vdd"]
         xlabel = "VDD"
     elif x_axis == "let":
-        combined["x"] = pd.to_numeric(combined["LET"], errors="coerce")
+        combined["x"] = combined["LET"]
         xlabel = "LET"
     else:
-        combined["x"] = pd.to_numeric(combined["actual_freq"], errors="coerce")
+        combined["x"] = combined["actual_freq"]
         xlabel = "Frequency"
 
-    combined["y"] = pd.to_numeric(combined["cs"], errors="coerce")
-    combined["lower"] = pd.to_numeric(combined["lower"], errors="coerce")
-    combined["upper"] = pd.to_numeric(combined["upper"], errors="coerce")
+    combined["y"] = combined["cs"]
 
-    combined = combined.dropna(subset=["x", "y", "lower", "upper", "SR_NUM"])
+    combined = combined.dropna(subset=["x", "y", "lower", "upper", "sr_num"])
 
     if combined.empty:
-        print("Matching rows were found, but numeric plotting data was invalid after cleaning.")
+        print("Matching data was found, but plotting columns were invalid after cleaning.")
         return
 
-    combined = combined.sort_values(["SR_NUM", "x"])
+    combined = combined.sort_values(["sr_num", "x"])
 
-    title_parts = [f"Input={input_val}", f"SR_NUM={','.join(map(str, sr_nums))}"]
-
+    title_parts = [f"Input={input_val}", f"SR={','.join(map(str, sr_nums))}"]
     if x_axis != "vdd":
         title_parts.append(f"VDD={vdd_val}")
     if x_axis != "let":
@@ -206,10 +284,8 @@ def main():
     plt.figure(figsize=(9, 6))
 
     plotted_any = False
-    used_sheets = sorted(combined["source_sheet"].dropna().unique())
-
     for sr in sr_nums:
-        sr_df = combined[combined["SR_NUM"] == sr].sort_values("x")
+        sr_df = combined[combined["sr_num"] == sr].sort_values("x")
         if sr_df.empty:
             continue
 
@@ -239,9 +315,10 @@ def main():
     plt.legend()
     plt.tight_layout()
 
-    print("\nUsed sheets:")
-    for sheet in used_sheets:
-        print(f"- {sheet}")
+    used_locations = combined[["source_sheet", "header_row"]].drop_duplicates()
+    print("\nMatched table locations:")
+    for _, row in used_locations.iterrows():
+        print(f"- Sheet: {row['source_sheet']}, header row: {int(row['header_row'])}")
 
     plt.show()
 
