@@ -1,6 +1,9 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as XLImage
+import shutil
+import os
 
 
 REQUIRED_COLUMNS = {
@@ -176,24 +179,28 @@ def filter_table(df, x_axis, input_val, sr_nums, vdd_val=None, let_val=None, fre
 
 
 def main():
-    print("=== ISDE Automatic Plotter ===")
+    print("=== Plotter (Insert Graph Into Same Sheet) ===")
 
     file_path = input("Excel file path: ").strip()
 
-    try:
-        wb = load_workbook(file_path, data_only=True)
-    except Exception as e:
-        print(f"Could not open workbook: {e}")
+    if not os.path.exists(file_path):
+        print("File not found.")
         return
+
+    base, ext = os.path.splitext(file_path)
+    new_file = base + "_with_graph.xlsx"
+    shutil.copy(file_path, new_file)
+
+    wb = load_workbook(new_file, data_only=True)
 
     selected_sheet_name = prompt_sheet_choice(wb.sheetnames)
     ws = wb[selected_sheet_name]
 
-    print("\nEnter all plot settings.\n")
+    print("\nEnter plot settings:\n")
 
     x_axis = prompt_choice("Choose x-axis (vdd, let, frq): ", ["vdd", "let", "frq"])
     input_val = input("Input value: ").strip()
-    sr_nums = prompt_int_list("SR_NUMs (comma separated, e.g. 5,10,12): ")
+    sr_nums = prompt_int_list("SR_NUMs: ")
     scale = prompt_choice("Scale (linear/log): ", ["linear", "log"])
 
     vdd_val = None
@@ -202,53 +209,22 @@ def main():
 
     if x_axis != "vdd":
         vdd_val = prompt_float("Specify VDD: ")
-
     if x_axis != "let":
         let_val = prompt_float("Specify LET: ")
-
     if x_axis != "frq":
         freq_val = prompt_float("Specify freq: ")
 
-    print(f"\nScanning sheet '{selected_sheet_name}' for matching embedded tables...")
-
     all_tables = find_tables_in_sheet(ws)
-
-    if not all_tables:
-        print("No tables with the required columns were found in that sheet.")
-        return
-
     matched_frames = []
 
     for raw_df in all_tables:
-        try:
-            df = clean_table(raw_df)
-
-            needed = {
-                "vdd", "input", "ion", "freq", "actual_freq",
-                "sr_num", "cs", "upper", "lower",
-                "source_sheet", "header_row", "LET"
-            }
-            if not needed.issubset(set(df.columns)):
-                continue
-
-            filtered = filter_table(
-                df,
-                x_axis=x_axis,
-                input_val=input_val,
-                sr_nums=sr_nums,
-                vdd_val=vdd_val,
-                let_val=let_val,
-                freq_val=freq_val
-            )
-
-            if not filtered.empty:
-                matched_frames.append(filtered)
-
-        except Exception:
-            continue
+        df = clean_table(raw_df)
+        filtered = filter_table(df, x_axis, input_val, sr_nums, vdd_val, let_val, freq_val)
+        if not filtered.empty:
+            matched_frames.append(filtered)
 
     if not matched_frames:
-        print("No matching data found in the selected sheet.")
+        print("No matching data found.")
         return
 
     combined = pd.concat(matched_frames, ignore_index=True)
@@ -264,27 +240,14 @@ def main():
         xlabel = "Frequency"
 
     combined["y"] = combined["cs"]
-    combined = combined.dropna(subset=["x", "y", "lower", "upper", "sr_num"])
-
-    if combined.empty:
-        print("Matching data was found, but plotting columns were invalid after cleaning.")
-        return
-
+    combined = combined.dropna(subset=["x", "y"])
     combined = combined.sort_values(["sr_num", "x"])
 
-    title_parts = [f"Input={input_val}", f"SR={','.join(map(str, sr_nums))}"]
-    if x_axis != "vdd":
-        title_parts.append(f"VDD={vdd_val}")
-    if x_axis != "let":
-        title_parts.append(f"LET={let_val}")
-    if x_axis != "frq":
-        title_parts.append(f"FRQ={freq_val}")
-
+    # Plot
     plt.figure(figsize=(9, 6))
 
-    plotted_any = False
     for sr in sr_nums:
-        sr_df = combined[combined["sr_num"] == sr].sort_values("x")
+        sr_df = combined[combined["sr_num"] == sr]
         if sr_df.empty:
             continue
 
@@ -296,11 +259,6 @@ def main():
             capsize=4,
             label=f"SR{sr}"
         )
-        plotted_any = True
-
-    if not plotted_any:
-        print("No plottable data found.")
-        return
 
     if scale == "log":
         plt.yscale("log")
@@ -309,17 +267,26 @@ def main():
 
     plt.xlabel(xlabel)
     plt.ylabel("Cross Section")
-    plt.title("Cross Section Plot | " + ", ".join(title_parts))
-    plt.grid(True, which="both", linestyle="--", alpha=0.5)
+    plt.title("Cross Section Plot")
+    plt.grid(True)
     plt.legend()
-    plt.tight_layout()
 
-    used_locations = combined[["source_sheet", "header_row"]].drop_duplicates()
-    print("\nMatched table locations:")
-    for _, row in used_locations.iterrows():
-        print(f"- Sheet: {row['source_sheet']}, header row: {int(row['header_row'])}")
+    img_path = "generated_plot.png"
+    plt.savefig(img_path)
+    plt.close()
 
-    plt.show()
+    # 🔥 INSERT INTO SAME SHEET
+    img = XLImage(img_path)
+
+    # place it to the right of existing data
+    anchor_col = ws.max_column + 2
+    anchor_cell = f"{chr(64 + anchor_col)}2" if anchor_col <= 26 else "J2"
+
+    ws.add_image(img, anchor_cell)
+
+    wb.save(new_file)
+
+    print(f"\nDone. Graph inserted into sheet '{selected_sheet_name}' in {new_file}")
 
 
 if __name__ == "__main__":
