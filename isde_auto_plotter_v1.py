@@ -1,13 +1,7 @@
 import os
 import re
-import shutil
-
 import pandas as pd
-from openpyxl import load_workbook
-from openpyxl.chart import ScatterChart, Series, Reference
-from openpyxl.chart.error_bar import ErrorBars
-from openpyxl.chart.data_source import NumDataSource, NumRef
-from openpyxl.utils import get_column_letter
+import xlwings as xw
 
 
 REQUIRED_COLUMNS = {
@@ -82,13 +76,6 @@ def prompt_sheet_choice(sheet_names):
 
 
 def parse_shift_register_token(token):
-    """
-    Accepts:
-      A-S5
-      Z-S12
-      S8
-      8
-    """
     token = token.strip().upper()
     if not token:
         return None
@@ -123,17 +110,39 @@ def prompt_shift_registers(prompt_text):
         print("Enter comma-separated shift registers like: A-S5, Z-S10, S3, or type 'all'")
 
 
-def find_tables_in_sheet(ws):
+def find_tables_in_sheet_xlwings(ws):
+    used = ws.used_range
+    values = used.value
+
+    if not values:
+        return []
+
+    if not isinstance(values, list):
+        return []
+
+    if values and not isinstance(values[0], list):
+        values = [values]
+
+    max_row = len(values)
+    max_col = max(len(r) if isinstance(r, list) else 1 for r in values)
+
+    def get_cell(r, c):
+        try:
+            row = values[r - 1]
+            if not isinstance(row, list):
+                row = [row]
+            return row[c - 1] if c - 1 < len(row) else None
+        except Exception:
+            return None
+
     tables = []
-    max_row = ws.max_row
-    max_col = ws.max_column
     scanned_header_rows = set()
 
     for r in range(1, max_row + 1):
-        row_vals = [ws.cell(r, c).value for c in range(1, max_col + 1)]
+        row_vals = [get_cell(r, c) for c in range(1, max_col + 1)]
         normalized = [norm(v) for v in row_vals]
-
         present = set(v for v in normalized if v)
+
         if not REQUIRED_COLUMNS.issubset(present):
             continue
 
@@ -156,7 +165,7 @@ def find_tables_in_sheet(ws):
         for rr in range(r + 1, max_row + 1):
             row_dict = {}
             for col_name, col_idx in header_positions.items():
-                row_dict[col_name] = ws.cell(rr, col_idx).value
+                row_dict[col_name] = get_cell(rr, col_idx)
 
             if row_is_blank(list(row_dict.values())):
                 blank_streak += 1
@@ -170,7 +179,7 @@ def find_tables_in_sheet(ws):
 
         if data_rows:
             df = pd.DataFrame(data_rows)
-            df["source_sheet"] = ws.title
+            df["source_sheet"] = ws.name
             df["header_row"] = r
             tables.append(df)
 
@@ -197,7 +206,6 @@ def clean_table(df):
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["sr_num_raw"] = df["sr_num"].astype(str).str.strip()
-
     extracted_sr_num = df["sr_num_raw"].str.extract(r"(\d+)", expand=False)
     df["sr_num_numeric"] = pd.to_numeric(extracted_sr_num, errors="coerce")
 
@@ -214,6 +222,19 @@ def clean_table(df):
 
 def float_matches(series, value, tol=1e-9):
     return series.notna() & ((series - value).abs() < tol)
+
+
+def unique_sorted_non_null(values):
+    cleaned = []
+    for v in values:
+        if pd.isna(v):
+            continue
+        if v not in cleaned:
+            cleaned.append(v)
+    try:
+        return sorted(cleaned)
+    except TypeError:
+        return cleaned
 
 
 def filter_table(df, x_axis, input_val, selected_srs, vdd_val=None, let_val=None, freq_val=None):
@@ -259,7 +280,7 @@ def filter_table(df, x_axis, input_val, selected_srs, vdd_val=None, let_val=None
 
 
 def format_vdd_title(vdd_val):
-    if vdd_val is None or vdd_val == "all":
+    if vdd_val is None or vdd_val == "all" or pd.isna(vdd_val):
         return None
     if vdd_val < 10:
         return f"{int(round(vdd_val * 1000))} mV"
@@ -267,7 +288,7 @@ def format_vdd_title(vdd_val):
 
 
 def format_freq_title(freq_val):
-    if freq_val is None or freq_val == "all":
+    if freq_val is None or freq_val == "all" or pd.isna(freq_val):
         return None
     if float(freq_val).is_integer():
         return f"{int(freq_val)} MHz"
@@ -275,7 +296,7 @@ def format_freq_title(freq_val):
 
 
 def format_let_title(let_val):
-    if let_val is None or let_val == "all":
+    if let_val is None or let_val == "all" or pd.isna(let_val):
         return None
     if float(let_val).is_integer():
         return f"LET {int(let_val)}"
@@ -287,10 +308,8 @@ def build_plot_title(x_axis, input_val, vdd_val=None, let_val=None, freq_val=Non
 
     if x_axis != "vdd" and vdd_val not in [None, "all"]:
         title_parts.append(format_vdd_title(vdd_val))
-
     if x_axis != "frq" and freq_val not in [None, "all"]:
         title_parts.append(format_freq_title(freq_val))
-
     if x_axis != "let" and let_val not in [None, "all"]:
         title_parts.append(format_let_title(let_val))
 
@@ -299,7 +318,7 @@ def build_plot_title(x_axis, input_val, vdd_val=None, let_val=None, freq_val=Non
     else:
         title_parts.append("All Inputs")
 
-    return " ".join(title_parts)
+    return " ".join([p for p in title_parts if p])
 
 
 def build_series_label_from_group(sr_df, requested_srs, sr_num, x_axis):
@@ -322,26 +341,129 @@ def build_series_label_from_group(sr_df, requested_srs, sr_num, x_axis):
 
     if x_axis != "vdd" and sr_df["vdd"].notna().any():
         extras.append(format_vdd_title(sr_df["vdd"].iloc[0]))
-
     if x_axis != "let" and sr_df["LET"].notna().any():
         extras.append(format_let_title(sr_df["LET"].iloc[0]))
-
     if x_axis != "frq" and sr_df["freq"].notna().any():
         extras.append(format_freq_title(sr_df["freq"].iloc[0]))
-
     if sr_df["input"].notna().any():
-        input_value = str(sr_df["input"].iloc[0]).strip()
-        extras.append(f"Input {input_value}")
+        extras.append(f"Input {str(sr_df['input'].iloc[0]).strip()}")
 
-    if extras:
-        return f"{base} ({', '.join(extras)})"
-    return base
+    extras = [x for x in extras if x]
+    return f"{base} ({', '.join(extras)})" if extras else base
 
 
-def write_helper_data_for_chart(ws, combined, selected_srs, helper_start_col, x_axis):
-    current_col = helper_start_col
-    series_meta = []
+def choose_split_dimension(x_axis, input_val, vdd_val, let_val, freq_val):
+    if str(input_val).strip().lower() == "all":
+        return "input"
+    if x_axis != "vdd" and vdd_val == "all":
+        return "vdd"
+    if x_axis != "frq" and freq_val == "all":
+        return "freq"
+    if x_axis != "let" and let_val == "all":
+        return "LET"
+    return None
 
+
+def chart_title_for_subset(x_axis, subset_df, input_val, vdd_val, let_val, freq_val):
+    title_parts = []
+
+    if x_axis != "vdd":
+        if vdd_val == "all":
+            if subset_df["vdd"].notna().any():
+                title_parts.append(format_vdd_title(subset_df["vdd"].iloc[0]))
+        elif vdd_val is not None:
+            title_parts.append(format_vdd_title(vdd_val))
+
+    if x_axis != "frq":
+        if freq_val == "all":
+            if subset_df["freq"].notna().any():
+                title_parts.append(format_freq_title(subset_df["freq"].iloc[0]))
+        elif freq_val is not None:
+            title_parts.append(format_freq_title(freq_val))
+
+    if x_axis != "let":
+        if let_val == "all":
+            if subset_df["LET"].notna().any():
+                title_parts.append(format_let_title(subset_df["LET"].iloc[0]))
+        elif let_val is not None:
+            title_parts.append(format_let_title(let_val))
+
+    if str(input_val).strip().lower() == "all":
+        if subset_df["input"].notna().any():
+            title_parts.append(f"Input {subset_df['input'].iloc[0]}")
+    else:
+        title_parts.append(f"Input {input_val}")
+
+    return " ".join([p for p in title_parts if p])
+
+
+def last_used_col(ws):
+    return ws.used_range.last_cell.column
+
+
+def clear_old_autoplotter_objects(ws):
+    try:
+        for ch in list(ws.charts):
+            try:
+                if str(ch.name).startswith("AutoPlotter_"):
+                    ch.delete()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def write_helper_block(ws, start_col, start_row, series_dicts):
+    """
+    Writes helper data in a chart-friendly rectangular format:
+
+    col 1: shared x values
+    col 2..N: one y column per series
+
+    Assumes all series in a chart use the same x sweep, which is the normal
+    case for these ISDE plots.
+    """
+    nonempty = [s for s in series_dicts if not s["df"].empty]
+    if not nonempty:
+        return None
+
+    # Build master x list from all series
+    all_x = []
+    for s in nonempty:
+        for x in s["df"]["x"].tolist():
+            if pd.notna(x) and x not in all_x:
+                all_x.append(float(x))
+    all_x = sorted(all_x)
+
+    # Header row
+    ws.range((start_row, start_col)).value = "x"
+    for i, s in enumerate(nonempty, start=1):
+        ws.range((start_row, start_col + i)).value = s["label"]
+
+    # X column
+    for r_offset, x in enumerate(all_x, start=1):
+        ws.range((start_row + r_offset, start_col)).value = x
+
+    # Y columns aligned to x
+    for i, s in enumerate(nonempty, start=1):
+        df = s["df"].sort_values("x").copy()
+        y_map = {}
+        for _, row in df.iterrows():
+            if pd.notna(row["x"]) and pd.notna(row["y"]):
+                y_map[float(row["x"])] = float(row["y"])
+
+        for r_offset, x in enumerate(all_x, start=1):
+            ws.range((start_row + r_offset, start_col + i)).value = y_map.get(x, None)
+
+    return {
+        "start_row": start_row,
+        "end_row": start_row + len(all_x),
+        "start_col": start_col,
+        "end_col": start_col + len(nonempty),
+    }
+
+
+def build_series_dicts(combined, selected_srs, x_axis, split_dim=None):
     group_cols = ["sr_num_numeric", "sr_prefix"]
 
     if x_axis != "vdd":
@@ -353,6 +475,10 @@ def write_helper_data_for_chart(ws, combined, selected_srs, helper_start_col, x_
 
     group_cols.append("input")
 
+    if split_dim is not None and split_dim in group_cols:
+        group_cols.remove(split_dim)
+
+    series_dicts = []
     grouped = combined.groupby(group_cols, dropna=False)
 
     for _, sr_df in grouped:
@@ -363,237 +489,225 @@ def write_helper_data_for_chart(ws, combined, selected_srs, helper_start_col, x_
         sr_num = sr_df["sr_num_numeric"].iloc[0]
         label = build_series_label_from_group(sr_df, selected_srs, sr_num, x_axis)
 
-        x_col = current_col
-        y_col = current_col + 1
-        plus_col = current_col + 2
-        minus_col = current_col + 3
-
-        ws.cell(row=1, column=x_col, value=f"{label}_x")
-        ws.cell(row=1, column=y_col, value=f"{label}_y")
-        ws.cell(row=1, column=plus_col, value=f"{label}_plus")
-        ws.cell(row=1, column=minus_col, value=f"{label}_minus")
-
-        start_row = 2
-        for i, (_, row) in enumerate(sr_df.iterrows(), start=start_row):
-            ws.cell(row=i, column=x_col, value=float(row["x"]))
-            ws.cell(row=i, column=y_col, value=float(row["y"]))
-            ws.cell(row=i, column=plus_col, value=float(row["upper"]))
-            ws.cell(row=i, column=minus_col, value=float(row["lower"]))
-
-        end_row = start_row + len(sr_df) - 1
-
-        series_meta.append({
+        series_dicts.append({
             "label": label,
-            "x_col": x_col,
-            "y_col": y_col,
-            "plus_col": plus_col,
-            "minus_col": minus_col,
-            "start_row": start_row,
-            "end_row": end_row,
+            "df": sr_df
         })
 
-        for col_idx in [x_col, y_col, plus_col, minus_col]:
-            ws.column_dimensions[get_column_letter(col_idx)].hidden = True
-
-        current_col += 5
-
-    return series_meta
+    return series_dicts
 
 
-def add_native_excel_chart(ws, sheet_name, series_meta, x_axis, scale, chart_title, chart_anchor):
-    chart = ScatterChart()
-    chart.title = chart_title
-    chart.style = 2
-    chart.height = 14
-    chart.width = 24
+def add_scatter_chart_mac(ws, helper_meta, chart_title, x_axis, scale, anchor_left=500, anchor_top=20):
+    chart = ws.charts.add(left=anchor_left, top=anchor_top, width=900, height=450)
+    try:
+        chart.name = f"AutoPlotter_{abs(hash((ws.name, chart_title, anchor_left, anchor_top))) % 10**8}"
+    except Exception:
+        pass
 
-    if x_axis == "vdd":
-        chart.x_axis.title = "VDD"
-    elif x_axis == "let":
-        chart.x_axis.title = "LET"
-    else:
-        chart.x_axis.title = "Frequency"
+    src = ws.range(
+        (helper_meta["start_row"], helper_meta["start_col"]),
+        (helper_meta["end_row"], helper_meta["end_col"])
+    )
 
-    chart.y_axis.title = "Cross Section"
-    chart.legend.position = "r"
+    chart.set_source_data(src)
+    chart.chart_type = "xy_scatter_lines_no_markers"
+
+    api_raw = chart.api
+    api_chart = api_raw[1] if isinstance(api_raw, tuple) else api_raw
+
+    try:
+        api_chart.has_title.set(True)
+        api_chart.chart_title.characters().text.set(chart_title)
+    except Exception:
+        pass
+
+    try:
+        cat_axis = api_chart.axes(1)
+        val_axis = api_chart.axes(2)
+
+        cat_axis.has_title.set(True)
+        cat_axis.axis_title.characters().text.set(
+            "VDD" if x_axis == "vdd" else ("LET" if x_axis == "let" else "Frequency")
+        )
+
+        val_axis.has_title.set(True)
+        val_axis.axis_title.characters().text.set("Cross Section")
+    except Exception:
+        pass
 
     if scale == "log":
-        chart.y_axis.scaling.logBase = 10
+        try:
+            api_chart.axes(2).scale_type.set(-4133)
+        except Exception:
+            pass
         if x_axis == "frq":
-            chart.x_axis.scaling.logBase = 10
+            try:
+                api_chart.axes(1).scale_type.set(-4133)
+            except Exception:
+                pass
 
-    for meta in series_meta:
-        xref = Reference(
-            ws,
-            min_col=meta["x_col"],
-            min_row=meta["start_row"],
-            max_row=meta["end_row"]
-        )
-        yref = Reference(
-            ws,
-            min_col=meta["y_col"],
-            min_row=meta["start_row"],
-            max_row=meta["end_row"]
-        )
+    return chart
 
-        series = Series(yref, xref, title=meta["label"])
-        series.marker.symbol = "circle"
-        series.graphicalProperties.line.width = 19050
 
-        plus_range = f"'{sheet_name}'!${get_column_letter(meta['plus_col'])}${meta['start_row']}:${get_column_letter(meta['plus_col'])}${meta['end_row']}"
-        minus_range = f"'{sheet_name}'!${get_column_letter(meta['minus_col'])}${meta['start_row']}:${get_column_letter(meta['minus_col'])}${meta['end_row']}"
+def split_and_plot_on_same_sheet(ws, combined, selected_srs, x_axis, scale, input_val, vdd_val, let_val, freq_val):
+    split_dim = choose_split_dimension(x_axis, input_val, vdd_val, let_val, freq_val)
 
-        err_bars = ErrorBars()
-        err_bars.errDir = "y"
-        err_bars.errBarType = "both"
-        err_bars.noEndCap = False
-        err_bars.plus = NumDataSource(numRef=NumRef(f=plus_range))
-        err_bars.minus = NumDataSource(numRef=NumRef(f=minus_range))
-        series.errBars = err_bars
+    clear_old_autoplotter_objects(ws)
 
-        chart.series.append(series)
+    helper_start_col = last_used_col(ws) + 3
+    helper_row_ptr = 1
 
-    ws.add_chart(chart, chart_anchor)
+    if split_dim is None:
+        plot_title = build_plot_title(x_axis, input_val, vdd_val, let_val, freq_val)
 
+        series_dicts = build_series_dicts(combined, selected_srs, x_axis, None)
+        helper_meta = write_helper_block(ws, helper_start_col, helper_row_ptr, series_dicts)
+
+        if not helper_meta:
+            return 0
+
+        anchor_left = max(500, ws.range((1, helper_start_col)).left + 50)
+        add_scatter_chart_mac(ws, helper_meta, plot_title, x_axis, scale, anchor_left, 20)
+        return 1
+
+    values = unique_sorted_non_null(combined[split_dim].unique())
+    if not values:
+        return 0
+
+    chart_count = 0
+    chart_top = 20
+
+    for value in values:
+        subset_df = combined[combined[split_dim] == value].copy()
+        if subset_df.empty:
+            continue
+
+        subset_df = subset_df.sort_values(["sr_num_numeric", "input", "x"])
+
+        chart_title = chart_title_for_subset(x_axis, subset_df, input_val, vdd_val, let_val, freq_val)
+        series_dicts = build_series_dicts(subset_df, selected_srs, x_axis, split_dim)
+        helper_meta = write_helper_block(ws, helper_start_col, helper_row_ptr, series_dicts)
+
+        if not helper_meta:
+            continue
+
+        anchor_left = max(500, ws.range((1, helper_start_col)).left + 50)
+        add_scatter_chart_mac(ws, helper_meta, chart_title, x_axis, scale, anchor_left, chart_top)
+
+        chart_count += 1
+        chart_top += 470
+        helper_row_ptr = helper_meta["end_row"] + 6
+
+    return chart_count
 
 def main():
-    print("=== ISDE Automatic Plotter (Native Excel Chart) ===")
+    print("=== ISDE Automatic Plotter (Mac xlwings) ===")
 
     file_path = input("Excel file path: ").strip()
-
     if not os.path.exists(file_path):
         print("File not found.")
         return
 
-    base, ext = os.path.splitext(file_path)
-    new_file = base + "_with_graph.xlsx"
-    shutil.copy(file_path, new_file)
+    app = None
+    wb = None
 
-    wb_data = load_workbook(new_file, data_only=True)
+    try:
+        app = xw.App(visible=True)
+        app.display_alerts = False
+        app.screen_updating = False
 
-    selected_sheet_name = prompt_sheet_choice(wb_data.sheetnames)
-    ws_data = wb_data[selected_sheet_name]
+        wb = app.books.open(file_path)
 
-    print("\nEnter plot settings:\n")
+        selected_sheet_name = prompt_sheet_choice([s.name for s in wb.sheets])
+        ws = wb.sheets[selected_sheet_name]
 
-    x_axis = prompt_choice("Choose x-axis (vdd, let, frq): ", ["vdd", "let", "frq"])
-    input_val = prompt_input_value("Input value (or type 'all'): ")
-    selected_srs = prompt_shift_registers(
-        "Shift registers (comma separated, e.g. A-S5, Z-S10, or type 'all'): "
-    )
-    scale = prompt_choice("Scale (linear/log): ", ["linear", "log"])
+        print("\nEnter plot settings:\n")
+        x_axis = prompt_choice("Choose x-axis (vdd, let, frq): ", ["vdd", "let", "frq"])
+        input_val = prompt_input_value("Input value (or type 'all'): ")
+        selected_srs = prompt_shift_registers("Shift registers (comma separated, e.g. A-S5, Z-S10, or type 'all'): ")
+        scale = prompt_choice("Scale (linear/log): ", ["linear", "log"])
 
-    vdd_val = None
-    let_val = None
-    freq_val = None
+        vdd_val = None
+        let_val = None
+        freq_val = None
 
-    if x_axis != "vdd":
-        vdd_val = prompt_float_or_all("Specify VDD (or type 'all'): ")
+        if x_axis != "vdd":
+            vdd_val = prompt_float_or_all("Specify VDD (or type 'all'): ")
+        if x_axis != "let":
+            let_val = prompt_float_or_all("Specify LET (or type 'all'): ")
+        if x_axis != "frq":
+            freq_val = prompt_float_or_all("Specify freq (or type 'all'): ")
 
-    if x_axis != "let":
-        let_val = prompt_float_or_all("Specify LET (or type 'all'): ")
+        print(f"\nScanning sheet '{selected_sheet_name}' for matching embedded tables...")
 
-    if x_axis != "frq":
-        freq_val = prompt_float_or_all("Specify freq (or type 'all'): ")
+        all_tables = find_tables_in_sheet_xlwings(ws)
+        if not all_tables:
+            print("No tables with the required columns were found in that sheet.")
+            return
 
-    print(f"\nScanning sheet '{selected_sheet_name}' for matching embedded tables...")
+        matched_frames = []
+        for raw_df in all_tables:
+            try:
+                df = clean_table(raw_df)
+                filtered = filter_table(df, x_axis, input_val, selected_srs, vdd_val, let_val, freq_val)
+                if not filtered.empty:
+                    matched_frames.append(filtered)
+            except Exception:
+                continue
 
-    all_tables = find_tables_in_sheet(ws_data)
+        if not matched_frames:
+            print("No matching data found in the selected sheet.")
+            return
 
-    if not all_tables:
-        print("No tables with the required columns were found in that sheet.")
-        return
+        combined = pd.concat(matched_frames, ignore_index=True)
 
-    matched_frames = []
+        if x_axis == "vdd":
+            combined["x"] = combined["vdd"]
+        elif x_axis == "let":
+            combined["x"] = combined["LET"]
+        else:
+            combined["x"] = combined["actual_freq"]
 
-    for raw_df in all_tables:
+        combined["y"] = combined["cs"]
+        combined = combined.dropna(subset=["x", "y", "lower", "upper", "sr_num_numeric", "input"])
+
+        if combined.empty:
+            print("Matching data was found, but plotting columns were invalid after cleaning.")
+            return
+
+        combined = combined.sort_values(["sr_num_numeric", "input", "x"])
+
+        used_locations = combined[["source_sheet", "header_row"]].drop_duplicates()
+        print("\nMatched table locations:")
+        for _, row in used_locations.iterrows():
+            print(f"- Sheet: {row['source_sheet']}, header row: {int(row['header_row'])}")
+
+        chart_count = split_and_plot_on_same_sheet(
+            ws, combined, selected_srs, x_axis, scale, input_val, vdd_val, let_val, freq_val
+        )
+
+        if chart_count == 0:
+            print("No plottable chart was created.")
+            return
+
+        app.screen_updating = True
+        wb.save()
+
+        print(f"\nDone. Inserted {chart_count} chart(s) into the original workbook.")
+        print(file_path)
+
+    finally:
         try:
-            df = clean_table(raw_df)
-
-            filtered = filter_table(
-                df=df,
-                x_axis=x_axis,
-                input_val=input_val,
-                selected_srs=selected_srs,
-                vdd_val=vdd_val,
-                let_val=let_val,
-                freq_val=freq_val
-            )
-
-            if not filtered.empty:
-                matched_frames.append(filtered)
-
+            if wb is not None:
+                wb.save()
+                wb.close()
         except Exception:
-            continue
-
-    if not matched_frames:
-        print("No matching data found in the selected sheet.")
-        return
-
-    combined = pd.concat(matched_frames, ignore_index=True)
-
-    if x_axis == "vdd":
-        combined["x"] = combined["vdd"]
-    elif x_axis == "let":
-        combined["x"] = combined["LET"]
-    else:
-        combined["x"] = combined["actual_freq"]
-
-    combined["y"] = combined["cs"]
-    combined = combined.dropna(subset=["x", "y", "lower", "upper", "sr_num_numeric", "input"])
-
-    if combined.empty:
-        print("Matching data was found, but plotting columns were invalid after cleaning.")
-        return
-
-    combined = combined.sort_values(["sr_num_numeric", "input", "x"])
-
-    plot_title = build_plot_title(
-        x_axis=x_axis,
-        input_val=input_val,
-        vdd_val=vdd_val,
-        let_val=let_val,
-        freq_val=freq_val
-    )
-
-    used_locations = combined[["source_sheet", "header_row"]].drop_duplicates()
-    print("\nMatched table locations:")
-    for _, row in used_locations.iterrows():
-        print(f"- Sheet: {row['source_sheet']}, header row: {int(row['header_row'])}")
-
-    wb_write = load_workbook(new_file)
-    ws_write = wb_write[selected_sheet_name]
-
-    original_max_col = ws_write.max_column
-    helper_start_col = original_max_col + 20
-    chart_anchor_col = original_max_col + 2
-    chart_anchor = f"{get_column_letter(chart_anchor_col)}2"
-
-    series_meta = write_helper_data_for_chart(
-        ws=ws_write,
-        combined=combined,
-        selected_srs=selected_srs,
-        helper_start_col=helper_start_col,
-        x_axis=x_axis
-    )
-
-    if not series_meta:
-        print("No plottable data found.")
-        return
-
-    add_native_excel_chart(
-        ws=ws_write,
-        sheet_name=selected_sheet_name,
-        series_meta=series_meta,
-        x_axis=x_axis,
-        scale=scale,
-        chart_title=plot_title,
-        chart_anchor=chart_anchor
-    )
-
-    wb_write.save(new_file)
-
-    print(f"\nDone. Native Excel chart inserted into sheet '{selected_sheet_name}' in {new_file}")
+            pass
+        try:
+            if app is not None:
+                app.quit()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
