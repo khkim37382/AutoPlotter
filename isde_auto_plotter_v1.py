@@ -415,53 +415,50 @@ def clear_old_autoplotter_objects(ws):
 
 def write_helper_block(ws, start_col, start_row, series_dicts):
     """
-    Writes helper data in a chart-friendly rectangular format:
+    Write helper data as repeated X/Y column pairs:
 
-    col 1: shared x values
-    col 2..N: one y column per series
+    col A: series1_x
+    col B: series1_y
+    col C: series2_x
+    col D: series2_y
+    ...
 
-    Assumes all series in a chart use the same x sweep, which is the normal
-    case for these ISDE plots.
+    This layout works much better with Excel scatter charts when using
+    chart.set_source_data(...).
     """
+    current_col = start_col
+    max_end_row = start_row
+
     nonempty = [s for s in series_dicts if not s["df"].empty]
     if not nonempty:
         return None
 
-    # Build master x list from all series
-    all_x = []
     for s in nonempty:
-        for x in s["df"]["x"].tolist():
-            if pd.notna(x) and x not in all_x:
-                all_x.append(float(x))
-    all_x = sorted(all_x)
-
-    # Header row
-    ws.range((start_row, start_col)).value = "x"
-    for i, s in enumerate(nonempty, start=1):
-        ws.range((start_row, start_col + i)).value = s["label"]
-
-    # X column
-    for r_offset, x in enumerate(all_x, start=1):
-        ws.range((start_row + r_offset, start_col)).value = x
-
-    # Y columns aligned to x
-    for i, s in enumerate(nonempty, start=1):
         df = s["df"].sort_values("x").copy()
-        y_map = {}
+        label = s["label"]
+
+        x_col = current_col
+        y_col = current_col + 1
+
+        ws.range((start_row, x_col)).value = f"{label}_x"
+        ws.range((start_row, y_col)).value = label
+
+        row_ptr = start_row + 1
         for _, row in df.iterrows():
             if pd.notna(row["x"]) and pd.notna(row["y"]):
-                y_map[float(row["x"])] = float(row["y"])
+                ws.range((row_ptr, x_col)).value = float(row["x"])
+                ws.range((row_ptr, y_col)).value = float(row["y"])
+                row_ptr += 1
 
-        for r_offset, x in enumerate(all_x, start=1):
-            ws.range((start_row + r_offset, start_col + i)).value = y_map.get(x, None)
+        max_end_row = max(max_end_row, row_ptr - 1)
+        current_col += 2
 
     return {
         "start_row": start_row,
-        "end_row": start_row + len(all_x),
+        "end_row": max_end_row,
         "start_col": start_col,
-        "end_col": start_col + len(nonempty),
+        "end_col": current_col - 1,
     }
-
 
 def build_series_dicts(combined, selected_srs, x_axis, split_dim=None):
     group_cols = ["sr_num_numeric", "sr_prefix"]
@@ -510,7 +507,7 @@ def add_scatter_chart_mac(ws, helper_meta, chart_title, x_axis, scale, anchor_le
     )
 
     chart.set_source_data(src)
-    chart.chart_type = "xy_scatter_lines_no_markers"
+    chart.chart_type = "xy_scatter_lines"
 
     api_raw = chart.api
     api_chart = api_raw[1] if isinstance(api_raw, tuple) else api_raw
@@ -527,11 +524,11 @@ def add_scatter_chart_mac(ws, helper_meta, chart_title, x_axis, scale, anchor_le
 
         cat_axis.has_title.set(True)
         cat_axis.axis_title.characters().text.set(
-            "VDD" if x_axis == "vdd" else ("LET" if x_axis == "let" else "Frequency")
+            "VDD" if x_axis == "vdd" else ("LET (MeV-cm²/mg)" if x_axis == "let" else "Frequency (MHz)")
         )
 
         val_axis.has_title.set(True)
-        val_axis.axis_title.characters().text.set("Cross Section")
+        val_axis.axis_title.characters().text.set("SEU cross-section (cm²)")
     except Exception:
         pass
 
@@ -547,7 +544,6 @@ def add_scatter_chart_mac(ws, helper_meta, chart_title, x_axis, scale, anchor_le
                 pass
 
     return chart
-
 
 def split_and_plot_on_same_sheet(ws, combined, selected_srs, x_axis, scale, input_val, vdd_val, let_val, freq_val):
     split_dim = choose_split_dimension(x_axis, input_val, vdd_val, let_val, freq_val)
