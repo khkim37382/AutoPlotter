@@ -47,13 +47,22 @@ def prompt_choice(prompt_text, valid_choices):
         print(f"Please enter one of: {', '.join(valid_choices)}")
 
 
-def prompt_float(prompt_text):
+def prompt_float_or_all(prompt_text):
     while True:
-        raw = input(prompt_text).strip()
+        raw = input(prompt_text).strip().lower()
+        if raw == "all":
+            return "all"
         try:
             return float(raw)
         except ValueError:
-            print("Please enter a valid number.")
+            print("Please enter a valid number or 'all'.")
+
+
+def prompt_input_value(prompt_text):
+    raw = input(prompt_text).strip()
+    if raw.lower() == "all":
+        return "all"
+    return raw
 
 
 def prompt_sheet_choice(sheet_names):
@@ -102,13 +111,16 @@ def parse_shift_register_token(token):
 def prompt_shift_registers(prompt_text):
     while True:
         raw = input(prompt_text).strip()
+        if raw.lower() == "all":
+            return "all"
+
         parts = [x.strip() for x in raw.split(",") if x.strip()]
         parsed = [parse_shift_register_token(x) for x in parts]
 
         if parts and all(p is not None for p in parsed):
             return parsed
 
-        print("Enter comma-separated shift registers like: A-S5, Z-S10, S3")
+        print("Enter comma-separated shift registers like: A-S5, Z-S10, S3, or type 'all'")
 
 
 def find_tables_in_sheet(ws):
@@ -207,45 +219,47 @@ def float_matches(series, value, tol=1e-9):
 def filter_table(df, x_axis, input_val, selected_srs, vdd_val=None, let_val=None, freq_val=None):
     filtered = df.copy()
 
-    filtered = filtered[filtered["input"] == str(input_val).strip()]
+    if str(input_val).strip().lower() != "all":
+        filtered = filtered[filtered["input"] == str(input_val).strip()]
 
-    selected_numbers = sorted(set(sr["number"] for sr in selected_srs))
-    filtered = filtered[filtered["sr_num_numeric"].isin(selected_numbers)]
+    if selected_srs != "all":
+        selected_numbers = sorted(set(sr["number"] for sr in selected_srs))
+        filtered = filtered[filtered["sr_num_numeric"].isin(selected_numbers)]
 
-    has_prefix_data = filtered["sr_prefix"].notna().any()
-    if has_prefix_data:
-        allowed_pairs = {(sr["prefix"], sr["number"]) for sr in selected_srs if sr["prefix"] is not None}
-        no_prefix_requests = {sr["number"] for sr in selected_srs if sr["prefix"] is None}
+        has_prefix_data = filtered["sr_prefix"].notna().any()
+        if has_prefix_data:
+            allowed_pairs = {(sr["prefix"], sr["number"]) for sr in selected_srs if sr["prefix"] is not None}
+            no_prefix_requests = {sr["number"] for sr in selected_srs if sr["prefix"] is None}
 
-        keep_mask = []
-        for _, row in filtered.iterrows():
-            sr_num = int(row["sr_num_numeric"]) if pd.notna(row["sr_num_numeric"]) else None
-            pair = (row["sr_prefix"], sr_num)
+            keep_mask = []
+            for _, row in filtered.iterrows():
+                sr_num = int(row["sr_num_numeric"]) if pd.notna(row["sr_num_numeric"]) else None
+                pair = (row["sr_prefix"], sr_num)
 
-            keep = False
-            if sr_num in no_prefix_requests:
-                keep = True
-            if pair in allowed_pairs:
-                keep = True
+                keep = False
+                if sr_num in no_prefix_requests:
+                    keep = True
+                if pair in allowed_pairs:
+                    keep = True
 
-            keep_mask.append(keep)
+                keep_mask.append(keep)
 
-        filtered = filtered[pd.Series(keep_mask, index=filtered.index)]
+            filtered = filtered[pd.Series(keep_mask, index=filtered.index)]
 
-    if x_axis != "vdd":
+    if x_axis != "vdd" and vdd_val != "all":
         filtered = filtered[float_matches(filtered["vdd"], vdd_val)]
 
-    if x_axis != "let":
+    if x_axis != "let" and let_val != "all":
         filtered = filtered[float_matches(filtered["LET"], let_val)]
 
-    if x_axis != "frq":
+    if x_axis != "frq" and freq_val != "all":
         filtered = filtered[float_matches(filtered["freq"], freq_val)]
 
     return filtered
 
 
 def format_vdd_title(vdd_val):
-    if vdd_val is None:
+    if vdd_val is None or vdd_val == "all":
         return None
     if vdd_val < 10:
         return f"{int(round(vdd_val * 1000))} mV"
@@ -253,7 +267,7 @@ def format_vdd_title(vdd_val):
 
 
 def format_freq_title(freq_val):
-    if freq_val is None:
+    if freq_val is None or freq_val == "all":
         return None
     if float(freq_val).is_integer():
         return f"{int(freq_val)} MHz"
@@ -261,7 +275,7 @@ def format_freq_title(freq_val):
 
 
 def format_let_title(let_val):
-    if let_val is None:
+    if let_val is None or let_val == "all":
         return None
     if float(let_val).is_integer():
         return f"LET {int(let_val)}"
@@ -271,46 +285,83 @@ def format_let_title(let_val):
 def build_plot_title(x_axis, input_val, vdd_val=None, let_val=None, freq_val=None):
     title_parts = []
 
-    if x_axis != "vdd" and vdd_val is not None:
+    if x_axis != "vdd" and vdd_val not in [None, "all"]:
         title_parts.append(format_vdd_title(vdd_val))
 
-    if x_axis != "frq" and freq_val is not None:
+    if x_axis != "frq" and freq_val not in [None, "all"]:
         title_parts.append(format_freq_title(freq_val))
 
-    if x_axis != "let" and let_val is not None:
+    if x_axis != "let" and let_val not in [None, "all"]:
         title_parts.append(format_let_title(let_val))
 
-    title_parts.append(f"Input {input_val}")
+    if str(input_val).strip().lower() != "all":
+        title_parts.append(f"Input {input_val}")
+    else:
+        title_parts.append("All Inputs")
+
     return " ".join(title_parts)
 
 
-def build_series_label(sr_df, requested_srs, sr_num):
+def build_series_label_from_group(sr_df, requested_srs, sr_num, x_axis):
     prefixes = sorted(set(x for x in sr_df["sr_prefix"].dropna().unique()))
     if len(prefixes) == 1:
-        return f"{prefixes[0]}-S{int(sr_num)}"
-    if len(prefixes) > 1:
-        return f"S{int(sr_num)}"
+        base = f"{prefixes[0]}-S{int(sr_num)}"
+    elif len(prefixes) > 1:
+        base = f"S{int(sr_num)}"
+    else:
+        if requested_srs != "all":
+            matching_requests = [sr for sr in requested_srs if sr["number"] == int(sr_num)]
+            if len(matching_requests) == 1 and matching_requests[0]["prefix"] is not None:
+                base = matching_requests[0]["raw"]
+            else:
+                base = f"S{int(sr_num)}"
+        else:
+            base = f"S{int(sr_num)}"
 
-    matching_requests = [sr for sr in requested_srs if sr["number"] == int(sr_num)]
-    if len(matching_requests) == 1 and matching_requests[0]["prefix"] is not None:
-        return matching_requests[0]["raw"]
-    return f"S{int(sr_num)}"
+    extras = []
+
+    if x_axis != "vdd" and sr_df["vdd"].notna().any():
+        extras.append(format_vdd_title(sr_df["vdd"].iloc[0]))
+
+    if x_axis != "let" and sr_df["LET"].notna().any():
+        extras.append(format_let_title(sr_df["LET"].iloc[0]))
+
+    if x_axis != "frq" and sr_df["freq"].notna().any():
+        extras.append(format_freq_title(sr_df["freq"].iloc[0]))
+
+    if sr_df["input"].notna().any():
+        input_value = str(sr_df["input"].iloc[0]).strip()
+        extras.append(f"Input {input_value}")
+
+    if extras:
+        return f"{base} ({', '.join(extras)})"
+    return base
 
 
-def write_helper_data_for_chart(ws, combined, selected_srs, helper_start_col):
-    """
-    Writes chart source data into hidden helper columns on the same sheet.
-    Returns metadata for each series so the native Excel chart can reference it.
-    """
+def write_helper_data_for_chart(ws, combined, selected_srs, helper_start_col, x_axis):
     current_col = helper_start_col
     series_meta = []
 
-    for sr_num in sorted(combined["sr_num_numeric"].dropna().unique()):
-        sr_df = combined[combined["sr_num_numeric"] == sr_num].sort_values("x").copy()
+    group_cols = ["sr_num_numeric", "sr_prefix"]
+
+    if x_axis != "vdd":
+        group_cols.append("vdd")
+    if x_axis != "let":
+        group_cols.append("LET")
+    if x_axis != "frq":
+        group_cols.append("freq")
+
+    group_cols.append("input")
+
+    grouped = combined.groupby(group_cols, dropna=False)
+
+    for _, sr_df in grouped:
+        sr_df = sr_df.sort_values("x").copy()
         if sr_df.empty:
             continue
 
-        label = build_series_label(sr_df, selected_srs, sr_num)
+        sr_num = sr_df["sr_num_numeric"].iloc[0]
+        label = build_series_label_from_group(sr_df, selected_srs, sr_num, x_axis)
 
         x_col = current_col
         y_col = current_col + 1
@@ -387,7 +438,7 @@ def add_native_excel_chart(ws, sheet_name, series_meta, x_axis, scale, chart_tit
 
         series = Series(yref, xref, title=meta["label"])
         series.marker.symbol = "circle"
-        series.graphicalProperties.line.width = 19050  # modest line width
+        series.graphicalProperties.line.width = 19050
 
         plus_range = f"'{sheet_name}'!${get_column_letter(meta['plus_col'])}${meta['start_row']}:${get_column_letter(meta['plus_col'])}${meta['end_row']}"
         minus_range = f"'{sheet_name}'!${get_column_letter(meta['minus_col'])}${meta['start_row']}:${get_column_letter(meta['minus_col'])}${meta['end_row']}"
@@ -426,9 +477,9 @@ def main():
     print("\nEnter plot settings:\n")
 
     x_axis = prompt_choice("Choose x-axis (vdd, let, frq): ", ["vdd", "let", "frq"])
-    input_val = input("Input value: ").strip()
+    input_val = prompt_input_value("Input value (or type 'all'): ")
     selected_srs = prompt_shift_registers(
-        "Shift registers (comma separated, e.g. A-S5, Z-S10): "
+        "Shift registers (comma separated, e.g. A-S5, Z-S10, or type 'all'): "
     )
     scale = prompt_choice("Scale (linear/log): ", ["linear", "log"])
 
@@ -437,13 +488,13 @@ def main():
     freq_val = None
 
     if x_axis != "vdd":
-        vdd_val = prompt_float("Specify VDD: ")
+        vdd_val = prompt_float_or_all("Specify VDD (or type 'all'): ")
 
     if x_axis != "let":
-        let_val = prompt_float("Specify LET: ")
+        let_val = prompt_float_or_all("Specify LET (or type 'all'): ")
 
     if x_axis != "frq":
-        freq_val = prompt_float("Specify freq: ")
+        freq_val = prompt_float_or_all("Specify freq (or type 'all'): ")
 
     print(f"\nScanning sheet '{selected_sheet_name}' for matching embedded tables...")
 
@@ -489,13 +540,13 @@ def main():
         combined["x"] = combined["actual_freq"]
 
     combined["y"] = combined["cs"]
-    combined = combined.dropna(subset=["x", "y", "lower", "upper", "sr_num_numeric"])
+    combined = combined.dropna(subset=["x", "y", "lower", "upper", "sr_num_numeric", "input"])
 
     if combined.empty:
         print("Matching data was found, but plotting columns were invalid after cleaning.")
         return
 
-    combined = combined.sort_values(["sr_num_numeric", "x"])
+    combined = combined.sort_values(["sr_num_numeric", "input", "x"])
 
     plot_title = build_plot_title(
         x_axis=x_axis,
@@ -510,7 +561,6 @@ def main():
     for _, row in used_locations.iterrows():
         print(f"- Sheet: {row['source_sheet']}, header row: {int(row['header_row'])}")
 
-    # Reopen workbook in normal mode for writing real Excel chart objects
     wb_write = load_workbook(new_file)
     ws_write = wb_write[selected_sheet_name]
 
@@ -523,7 +573,8 @@ def main():
         ws=ws_write,
         combined=combined,
         selected_srs=selected_srs,
-        helper_start_col=helper_start_col
+        helper_start_col=helper_start_col,
+        x_axis=x_axis
     )
 
     if not series_meta:
